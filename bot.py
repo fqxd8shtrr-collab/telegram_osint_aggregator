@@ -1,14 +1,18 @@
+import asyncio
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import config
 import database as db
 import stats as stats_mod
+import utils
+from listener import Listener
+from queue_manager import QueueManager
 
 logger = logging.getLogger(__name__)
 
 class ControlBot:
-    def __init__(self, listener, queue_manager):
+    def __init__(self, listener: Listener, queue_manager: QueueManager):
         self.listener = listener
         self.queue_manager = queue_manager
         self.app = None
@@ -28,12 +32,18 @@ class ControlBot:
         await self.app.updater.stop()
         await self.app.stop()
 
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in config.ALLOWED_USER_IDS:
-            await update.message.reply_text("⛔ غير مصرح.")
-            return
+    # ---------- Common function to send or edit message ----------
+    async def send_or_edit(self, update: Update, text: str, reply_markup=None):
+        """Send a new message or edit existing one based on context."""
+        if update.callback_query:
+            # Editing an existing message
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            # New message from command or text
+            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
+    async def show_main_menu(self, update: Update):
+        """Display the main menu with reply keyboard."""
         keyboard = [
             [KeyboardButton("📡 إدارة المصادر"), KeyboardButton("🎯 التحكم بالإرسال")],
             [KeyboardButton("🧠 الذكاء الاصطناعي"), KeyboardButton("👥 إدارة الفريق")],
@@ -41,21 +51,20 @@ class ControlBot:
             [KeyboardButton("🗑 الإدارة")]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text(
-            "🌐 **Telegram OSINT Aggregator - Team Edition**\nاختر أحد الأزرار:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
+        text = "🌐 **Telegram OSINT Aggregator - Team Edition**\nاختر أحد الأزرار:"
+        await self.send_or_edit(update, text, reply_markup)
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id not in config.ALLOWED_USER_IDS:
+            await self.send_or_edit(update, "⛔ غير مصرح.")
+            return
+        await self.show_main_menu(update)
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if user_id not in config.ALLOWED_USER_IDS:
+        if update.effective_user.id not in config.ALLOWED_USER_IDS:
             await update.message.reply_text("⛔ غير مصرح.")
             return
-
         text = update.message.text
-        logger.info(f"Received text: {text}")
-
         if text == "📡 إدارة المصادر":
             await self.show_sources_menu(update, context)
         elif text == "🎯 التحكم بالإرسال":
@@ -71,7 +80,7 @@ class ControlBot:
         elif text == "🗑 الإدارة":
             await self.show_admin_menu(update, context)
         else:
-            # Check if there's an ongoing action
+            # Check if there is a pending action (like add_channel)
             action = context.user_data.get('action')
             if action:
                 await self.process_input(update, context, action, text)
@@ -86,7 +95,7 @@ class ControlBot:
             [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("📡 إدارة المصادر:", reply_markup=reply_markup)
+        await self.send_or_edit(update, "📡 إدارة المصادر:", reply_markup)
 
     async def show_forward_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
@@ -94,34 +103,35 @@ class ControlBot:
             [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("🎯 التحكم بالإرسال:", reply_markup=reply_markup)
+        await self.send_or_edit(update, "🎯 التحكم بالإرسال:", reply_markup)
 
     async def show_ai_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]]
+        keyboard = [
+            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("🧠 الذكاء الاصطناعي (قيد التطوير)", reply_markup=reply_markup)
+        await self.send_or_edit(update, "🧠 الذكاء الاصطناعي:", reply_markup)
 
     async def show_team_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]]
+        keyboard = [
+            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("👥 إدارة الفريق (قيد التطوير)", reply_markup=reply_markup)
+        await self.send_or_edit(update, "👥 إدارة الفريق:", reply_markup)
 
     async def show_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        try:
-            status = await stats_mod.get_system_status()
-            text = (
-                f"📊 **حالة النظام**\n"
-                f"🟢 الشبكة: {'تعمل' if status['is_running'] else 'متوقفة'}\n"
-                f"📡 القنوات: {status['total_channels']} (نشطة: {status['active_channels']})\n"
-                f"📨 الرسائل المرسلة: {status['total_forwarded']}\n"
-                f"🚨 التنبيهات المرسلة: {status['total_alerts']}\n"
-                f"🕒 آخر نشاط: {status['last_activity']}\n"
-                f"⚠️ آخر خطأ: {status['last_error']}\n"
-                f"⏱ التشغيل: {status['uptime']} ثانية\n"
-            )
-        except Exception as e:
-            text = f"❌ خطأ في جلب الإحصائيات: {e}"
-        await update.message.reply_text(text, parse_mode='Markdown')
+        status = await stats_mod.get_system_status()
+        text = (
+            f"📊 **حالة النظام**\n"
+            f"🟢 الشبكة: {'تعمل' if status['is_running'] else 'متوقفة'}\n"
+            f"📡 القنوات: {status['total_channels']} (نشطة: {status['active_channels']})\n"
+            f"📨 الرسائل المرسلة: {status['total_forwarded']}\n"
+            f"🚨 التنبيهات المرسلة: {status['total_alerts']}\n"
+            f"🕒 آخر نشاط: {status['last_activity']}\n"
+            f"⚠️ آخر خطأ: {status['last_error']}\n"
+            f"⏱ التشغيل: {status['uptime']}\n"
+        )
+        await self.send_or_edit(update, text)
 
     async def show_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
@@ -129,7 +139,7 @@ class ControlBot:
             [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("⚙️ الإعدادات:", reply_markup=reply_markup)
+        await self.send_or_edit(update, "⚙️ الإعدادات:", reply_markup)
 
     async def show_admin_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
@@ -137,7 +147,7 @@ class ControlBot:
             [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("🗑 الإدارة:", reply_markup=reply_markup)
+        await self.send_or_edit(update, "🗑 الإدارة:", reply_markup)
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -149,7 +159,7 @@ class ControlBot:
             return
 
         if data == "main_menu":
-            await self.start_command(update, context)
+            await self.show_main_menu(update)
             return
 
         elif data == "add_channel":
@@ -180,7 +190,7 @@ class ControlBot:
                 await query.edit_message_text("لا توجد وجهة رئيسية.")
                 return
             try:
-                await self.listener.send_message(primary, "🧪 رسالة اختبار من نظام الرصد.", {})
+                await self.listener.send_message(primary, "🧪 رسالة اختبار", {})
                 await query.edit_message_text("✅ تم إرسال رسالة اختبار.")
             except Exception as e:
                 await query.edit_message_text(f"❌ فشل الإرسال: {e}")
