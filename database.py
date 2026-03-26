@@ -12,7 +12,7 @@ def init_sync_db():
     data_dir = os.path.dirname(config.DB_PATH)
     if data_dir and not os.path.exists(data_dir):
         os.makedirs(data_dir)
-    
+
     conn = sqlite3.connect(config.DB_PATH)
     c = conn.cursor()
 
@@ -35,9 +35,8 @@ def init_sync_db():
             region TEXT
         )
     ''')
-    # ... باقي الجداول كما هي ...
 
-    # ---- Forwarded Messages (with dedup) ----
+    # ---- Forwarded Messages ----
     c.execute('''
         CREATE TABLE IF NOT EXISTS forwarded_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +50,7 @@ def init_sync_db():
         )
     ''')
 
-    # ---- Keyword Filters (global) ----
+    # ---- Keyword Filters ----
     c.execute('''
         CREATE TABLE IF NOT EXISTS keyword_filters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,7 +62,7 @@ def init_sync_db():
         )
     ''')
 
-    # ---- Channel-specific Filters ----
+    # ---- Channel Filters ----
     c.execute('''
         CREATE TABLE IF NOT EXISTS channel_filters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,18 +75,17 @@ def init_sync_db():
         )
     ''')
 
-    # ---- Content Type Filters (global) ----
+    # ---- Content Type Filters ----
     c.execute('''
         CREATE TABLE IF NOT EXISTS content_type_filters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content_type TEXT NOT NULL UNIQUE
         )
     ''')
-    # Insert defaults if empty
     for t in config.DEFAULT_CONTENT_TYPES:
         c.execute("INSERT OR IGNORE INTO content_type_filters (content_type) VALUES (?)", (t,))
 
-    # ---- Language Filters (global) ----
+    # ---- Language Filters ----
     c.execute('''
         CREATE TABLE IF NOT EXISTS language_filters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +97,7 @@ def init_sync_db():
     c.execute('''
         CREATE TABLE IF NOT EXISTS forward_targets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            target_type TEXT NOT NULL,   -- primary, backup, alert, normal_feed, priority_feed, critical_alert
+            target_type TEXT NOT NULL,
             target_identifier TEXT NOT NULL,
             enabled INTEGER DEFAULT 1,
             UNIQUE(target_type)
@@ -148,7 +146,7 @@ def init_sync_db():
             date TEXT PRIMARY KEY,
             total_messages INTEGER DEFAULT 0,
             total_alerts INTEGER DEFAULT 0,
-            channels_activity TEXT   -- JSON: {channel_id: count}
+            channels_activity TEXT
         )
     ''')
 
@@ -167,7 +165,7 @@ def init_sync_db():
         )
     ''')
 
-    # ---- Event Clusters (Correlation) ----
+    # ---- Event Clusters ----
     c.execute('''
         CREATE TABLE IF NOT EXISTS event_clusters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,8 +177,8 @@ def init_sync_db():
             first_seen TIMESTAMP,
             last_seen TIMESTAMP,
             message_count INTEGER,
-            channels TEXT,        -- JSON list of channel ids
-            status TEXT DEFAULT 'new'   -- new, under_review, confirmed, published, rejected
+            channels TEXT,
+            status TEXT DEFAULT 'new'
         )
     ''')
     c.execute('''
@@ -198,8 +196,8 @@ def init_sync_db():
         CREATE TABLE IF NOT EXISTS team_members (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            role TEXT NOT NULL,   -- admin, analyst, editor, monitor
-            desk TEXT,            -- category assigned
+            role TEXT NOT NULL,
+            desk TEXT,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
@@ -210,7 +208,7 @@ def init_sync_db():
             cluster_id INTEGER,
             assigned_to INTEGER,
             assigned_by INTEGER,
-            status TEXT DEFAULT 'new',   -- new, under_review, confirmed, published, rejected
+            status TEXT DEFAULT 'new',
             comment TEXT,
             assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -245,9 +243,20 @@ def init_sync_db():
     conn.commit()
     conn.close()
 
-# ---------- Async helpers ----------
-async def get_db():
-    return await aiosqlite.connect(config.DB_PATH)
+# ---------- Helper for async operations ----------
+async def _execute(query: str, params: tuple = ()):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        return await db.execute(query, params)
+
+async def _fetchone(query: str, params: tuple = ()):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        cursor = await db.execute(query, params)
+        return await cursor.fetchone()
+
+async def _fetchall(query: str, params: tuple = ()):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        cursor = await db.execute(query, params)
+        return await cursor.fetchall()
 
 # ---------- Source Channels ----------
 async def add_source_channel(channel_id: int, username: str = None, title: str = None, label: str = None, category: str = None,
@@ -255,7 +264,7 @@ async def add_source_channel(channel_id: int, username: str = None, title: str =
                              speed_score: float = config.DEFAULT_SPEED_SCORE,
                              priority_score: float = config.DEFAULT_PRIORITY_SCORE,
                              language: str = None, region: str = None) -> bool:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         try:
             await db.execute(
                 """INSERT INTO source_channels 
@@ -269,26 +278,26 @@ async def add_source_channel(channel_id: int, username: str = None, title: str =
             return False
 
 async def remove_source_channel(channel_id: int):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("DELETE FROM source_channels WHERE channel_id = ?", (channel_id,))
         await db.commit()
 
 async def get_all_channels() -> List[Dict]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM source_channels") as cur:
             rows = await cur.fetchall()
             return [dict(row) for row in rows]
 
 async def get_channel(channel_id: int) -> Optional[Dict]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM source_channels WHERE channel_id = ?", (channel_id,)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 
 async def update_channel_field(channel_id: int, field: str, value):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(f"UPDATE source_channels SET {field} = ? WHERE channel_id = ?", (value, channel_id))
         await db.commit()
 
@@ -321,18 +330,18 @@ async def update_channel_scores(channel_id: int, trust_score: float = None, spee
         values.append(priority_score)
     if updates:
         values.append(channel_id)
-        async with await get_db() as db:
+        async with aiosqlite.connect(config.DB_PATH) as db:
             await db.execute(f"UPDATE source_channels SET {', '.join(updates)} WHERE channel_id = ?", values)
             await db.commit()
 
 # ---------- Forwarded Messages ----------
 async def is_message_forwarded(channel_id: int, message_id: int) -> bool:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute("SELECT 1 FROM forwarded_messages WHERE source_channel_id = ? AND message_id = ?", (channel_id, message_id)) as cur:
             return await cur.fetchone() is not None
 
 async def mark_message_forwarded(channel_id: int, message_id: int, content_hash: str = None, grouped_id: int = None, normalized_text: str = None):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             "INSERT INTO forwarded_messages (source_channel_id, message_id, content_hash, grouped_id, normalized_text) VALUES (?, ?, ?, ?, ?)",
             (channel_id, message_id, content_hash, grouped_id, normalized_text)
@@ -340,13 +349,13 @@ async def mark_message_forwarded(channel_id: int, message_id: int, content_hash:
         await db.commit()
 
 async def is_content_duplicate(content_hash: str) -> bool:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute("SELECT 1 FROM forwarded_messages WHERE content_hash = ?", (content_hash,)) as cur:
             return await cur.fetchone() is not None
 
-# ---------- Keyword Filters (Global) ----------
+# ---------- Keyword Filters ----------
 async def add_keyword_filter(filter_type: str, keyword: str, is_regex: bool = False, case_sensitive: bool = False) -> bool:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         try:
             await db.execute(
                 "INSERT INTO keyword_filters (type, keyword, is_regex, case_sensitive) VALUES (?, ?, ?, ?)",
@@ -358,12 +367,12 @@ async def add_keyword_filter(filter_type: str, keyword: str, is_regex: bool = Fa
             return False
 
 async def remove_keyword_filter(filter_type: str, keyword: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("DELETE FROM keyword_filters WHERE type = ? AND keyword = ?", (filter_type, keyword))
         await db.commit()
 
 async def get_keyword_filters() -> Dict[str, List[Tuple[str, bool, bool]]]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         include = []
         exclude = []
         async with db.execute("SELECT keyword, is_regex, case_sensitive FROM keyword_filters WHERE type = 'include'") as cur:
@@ -374,7 +383,7 @@ async def get_keyword_filters() -> Dict[str, List[Tuple[str, bool, bool]]]:
 
 # ---------- Channel Filters ----------
 async def add_channel_filter(channel_id: int, filter_type: str, keyword: str, is_regex: bool = False, case_sensitive: bool = False):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             "INSERT INTO channel_filters (channel_id, filter_type, keyword, is_regex, case_sensitive) VALUES (?, ?, ?, ?, ?)",
             (channel_id, filter_type, keyword, 1 if is_regex else 0, 1 if case_sensitive else 0)
@@ -382,12 +391,12 @@ async def add_channel_filter(channel_id: int, filter_type: str, keyword: str, is
         await db.commit()
 
 async def remove_channel_filter(channel_id: int, filter_type: str, keyword: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("DELETE FROM channel_filters WHERE channel_id = ? AND filter_type = ? AND keyword = ?", (channel_id, filter_type, keyword))
         await db.commit()
 
 async def get_channel_filters(channel_id: int) -> Dict[str, List[Tuple[str, bool, bool]]]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         include = []
         exclude = []
         async with db.execute("SELECT keyword, is_regex, case_sensitive FROM channel_filters WHERE channel_id = ? AND filter_type = 'include'", (channel_id,)) as cur:
@@ -398,43 +407,43 @@ async def get_channel_filters(channel_id: int) -> Dict[str, List[Tuple[str, bool
 
 # ---------- Content Type Filters ----------
 async def set_content_type_filters(types: List[str]):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("DELETE FROM content_type_filters")
         for t in types:
             await db.execute("INSERT INTO content_type_filters (content_type) VALUES (?)", (t,))
         await db.commit()
 
 async def get_content_type_filters() -> List[str]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute("SELECT content_type FROM content_type_filters") as cur:
             rows = await cur.fetchall()
             return [row[0] for row in rows] if rows else config.DEFAULT_CONTENT_TYPES.copy()
 
 # ---------- Language Filters ----------
 async def add_language_filter(lang_code: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO language_filters (language_code) VALUES (?)", (lang_code,))
         await db.commit()
 
 async def remove_language_filter(lang_code: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("DELETE FROM language_filters WHERE language_code = ?", (lang_code,))
         await db.commit()
 
 async def get_language_filters() -> List[str]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute("SELECT language_code FROM language_filters") as cur:
             rows = await cur.fetchall()
             return [row[0] for row in rows]
 
 # ---------- Forward Targets ----------
 async def set_forward_target(target_type: str, identifier: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("REPLACE INTO forward_targets (target_type, target_identifier) VALUES (?, ?)", (target_type, identifier))
         await db.commit()
 
 async def get_forward_target(target_type: str) -> Optional[str]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute("SELECT target_identifier FROM forward_targets WHERE target_type = ? AND enabled = 1", (target_type,)) as cur:
             row = await cur.fetchone()
             return row[0] if row else None
@@ -453,13 +462,13 @@ async def get_all_forward_targets() -> Dict[str, str]:
 
 # ---------- Bot State ----------
 async def get_bot_state(key: str, default=None):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute("SELECT value FROM bot_state WHERE key = ?", (key,)) as cur:
             row = await cur.fetchone()
             return row[0] if row else default
 
 async def set_bot_state(key: str, value: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, value))
         await db.commit()
 
@@ -472,17 +481,17 @@ async def increment_total_alerts():
     await set_bot_state("total_alerts", str(current + 1))
 
 async def update_last_activity():
-    await set_bot_state("last_activity", datetime.datetime.utcnow().isoformat())
+    await set_bot_state("last_activity", datetime.datetime.now(datetime.UTC).isoformat())
 
 async def log_error(error: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("INSERT INTO error_logs (error) VALUES (?)", (error,))
         await db.commit()
     await set_bot_state("last_error", error[:200])
 
 # ---------- AI Evaluations ----------
 async def save_ai_evaluation(message_id: int, channel_id: int, scores: dict):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             "INSERT INTO ai_evaluations (message_id, channel_id, importance_score, urgency_score, confidence, event_type) VALUES (?, ?, ?, ?, ?, ?)",
             (message_id, channel_id, scores.get('importance', 0), scores.get('urgency', 0), scores.get('confidence', 0), scores.get('event_type', 'unknown'))
@@ -491,7 +500,7 @@ async def save_ai_evaluation(message_id: int, channel_id: int, scores: dict):
 
 # ---------- Event Clusters ----------
 async def add_event_cluster(cluster_hash: str, event_type: str, importance: float, urgency: float, confidence: float, channels: list, message_ids: list):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             "INSERT INTO event_clusters (cluster_hash, event_type, importance, urgency, confidence, first_seen, last_seen, message_count, channels) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, ?)",
             (cluster_hash, event_type, importance, urgency, confidence, len(message_ids), json.dumps(channels))
@@ -503,7 +512,7 @@ async def add_event_cluster(cluster_hash: str, event_type: str, importance: floa
         return cluster_id
 
 async def update_event_cluster(cluster_id: int, importance: float, urgency: float, confidence: float, channels: list, message_ids: list):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             "UPDATE event_clusters SET last_seen = datetime('now'), message_count = message_count + ?, channels = ?, importance = ?, urgency = ?, confidence = ? WHERE id = ?",
             (len(message_ids), json.dumps(channels), importance, urgency, confidence, cluster_id)
@@ -513,7 +522,7 @@ async def update_event_cluster(cluster_id: int, importance: float, urgency: floa
         await db.commit()
 
 async def get_existing_cluster(content_hash: str, window_seconds: int) -> Optional[int]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute('''
             SELECT c.id FROM event_clusters c
             JOIN cluster_messages cm ON c.id = cm.cluster_id
@@ -525,20 +534,20 @@ async def get_existing_cluster(content_hash: str, window_seconds: int) -> Option
             return row[0] if row else None
 
 async def get_event_cluster_by_id(cluster_id: int) -> Optional[Dict]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM event_clusters WHERE id = ?", (cluster_id,)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 
 async def update_event_cluster_status(cluster_id: int, status: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("UPDATE event_clusters SET status = ? WHERE id = ?", (status, cluster_id))
         await db.commit()
 
 # ---------- Team Management ----------
 async def add_team_member(user_id: int, username: str, role: str, desk: str = None):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             "INSERT OR REPLACE INTO team_members (user_id, username, role, desk) VALUES (?, ?, ?, ?)",
             (user_id, username, role, desk)
@@ -546,32 +555,32 @@ async def add_team_member(user_id: int, username: str, role: str, desk: str = No
         await db.commit()
 
 async def remove_team_member(user_id: int):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("DELETE FROM team_members WHERE user_id = ?", (user_id,))
         await db.commit()
 
 async def get_team_members() -> List[Dict]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM team_members") as cur:
             rows = await cur.fetchall()
             return [dict(row) for row in rows]
 
 async def get_team_member(user_id: int) -> Optional[Dict]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM team_members WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 
 async def update_member_role(user_id: int, role: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute("UPDATE team_members SET role = ? WHERE user_id = ?", (role, user_id))
         await db.commit()
 
 # ---------- Assignments ----------
 async def create_assignment(cluster_id: int, assigned_to: int, assigned_by: int, status: str = 'new'):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             "INSERT INTO assignments (cluster_id, assigned_to, assigned_by, status) VALUES (?, ?, ?, ?)",
             (cluster_id, assigned_to, assigned_by, status)
@@ -579,7 +588,7 @@ async def create_assignment(cluster_id: int, assigned_to: int, assigned_by: int,
         await db.commit()
 
 async def update_assignment_status(cluster_id: int, status: str, assigned_by: int = None):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         if assigned_by:
             await db.execute(
                 "UPDATE assignments SET status = ?, updated_at = datetime('now'), assigned_by = ? WHERE cluster_id = ?",
@@ -593,7 +602,7 @@ async def update_assignment_status(cluster_id: int, status: str, assigned_by: in
         await db.commit()
 
 async def get_assignment_by_cluster(cluster_id: int) -> Optional[Dict]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM assignments WHERE cluster_id = ?", (cluster_id,)) as cur:
             row = await cur.fetchone()
@@ -601,7 +610,7 @@ async def get_assignment_by_cluster(cluster_id: int) -> Optional[Dict]:
 
 # ---------- Comments ----------
 async def add_comment(cluster_id: int, user_id: int, comment: str):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             "INSERT INTO comments (cluster_id, user_id, comment) VALUES (?, ?, ?)",
             (cluster_id, user_id, comment)
@@ -609,7 +618,7 @@ async def add_comment(cluster_id: int, user_id: int, comment: str):
         await db.commit()
 
 async def get_comments(cluster_id: int) -> List[Dict]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM comments WHERE cluster_id = ? ORDER BY created_at", (cluster_id,)) as cur:
             rows = await cur.fetchall()
@@ -618,7 +627,7 @@ async def get_comments(cluster_id: int) -> List[Dict]:
 # ---------- Daily Stats ----------
 async def update_daily_stats(channel_id: int, is_alert: bool = False):
     today = datetime.date.today().isoformat()
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute("SELECT channels_activity FROM daily_stats WHERE date = ?", (today,)) as cur:
             row = await cur.fetchone()
             if row:
@@ -638,7 +647,7 @@ async def update_daily_stats(channel_id: int, is_alert: bool = False):
 
 async def get_daily_stats(days=7) -> Dict:
     result = {}
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         for i in range(days):
             date = (datetime.date.today() - datetime.timedelta(days=i)).isoformat()
             async with db.execute("SELECT total_messages, total_alerts, channels_activity FROM daily_stats WHERE date = ?", (date,)) as cur:
@@ -655,7 +664,7 @@ async def get_daily_stats(days=7) -> Dict:
 
 # ---------- Health Metrics ----------
 async def record_health_metric(metric_name: str, metric_value: float):
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             "INSERT INTO health_metrics (metric_name, metric_value) VALUES (?, ?)",
             (metric_name, metric_value)
@@ -663,7 +672,7 @@ async def record_health_metric(metric_name: str, metric_value: float):
         await db.commit()
 
 async def get_latest_health_metrics(limit: int = 100) -> List[Dict]:
-    async with await get_db() as db:
+    async with aiosqlite.connect(config.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM health_metrics ORDER BY timestamp DESC LIMIT ?", (limit,)) as cur:
             rows = await cur.fetchall()
