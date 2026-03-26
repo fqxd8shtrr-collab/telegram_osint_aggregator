@@ -1,46 +1,64 @@
-import hashlib
-import json
 import logging
-import config
-import database as db
+import hashlib
+from datetime import datetime, timedelta
+from database import AsyncSessionLocal, EventCluster, ClusterMessage, ForwardedMessage
+from sqlalchemy import select, func
 
 logger = logging.getLogger(__name__)
 
-async def correlate(message: dict):
-    """
-    message: dict with keys: message_id, channel_id, text, content_hash, normalized_text
-    """
-    content_hash = message["content_hash"]
-    # Check if we already have a cluster for this hash within the correlation window
-    window = int(await db.get_state("correlation_window", str(config.CORRELATION_WINDOW)))
-    rows = await db.fetch_all(
-        "SELECT c.* FROM clusters c JOIN cluster_messages cm ON c.id = cm.cluster_id JOIN messages m ON cm.message_id = m.message_id AND cm.channel_id = m.channel_id WHERE m.content_hash = ? AND c.last_seen > datetime('now', ?)",
-        (content_hash, f"-{window} seconds")
-    )
-    if rows:
-        # Found existing cluster
-        cluster_id = rows[0]["id"]
-        # Update cluster
-        await db.update_cluster(
-            cluster_id,
-            rows[0]["importance"],  # will average later? we'll keep simple: keep existing importance and update message count
-            rows[0]["urgency"],
-            rows[0]["confidence"],
-            json.loads(rows[0]["channels"]),
-            [(message["message_id"], message["channel_id"])]
-        )
-        logger.info(f"Correlated message {message['message_id']} to cluster {cluster_id}")
-    else:
-        # Create new cluster
-        cluster_hash = hashlib.sha256(f"{content_hash}_{message.get('eval_result', {}).get('event_type', 'unknown')}".encode()).hexdigest()
-        eval_res = message.get("eval_result", {})
-        await db.add_cluster(
-            cluster_hash,
-            eval_res.get("event_type", "عام"),
-            eval_res.get("importance", 0.5),
-            eval_res.get("urgency", 0.5),
-            eval_res.get("confidence", 0.5),
-            [message["channel_id"]],
-            [(message["message_id"], message["channel_id"])]
-        )
-        logger.info(f"Created new cluster for message {message['message_id']}")
+class CorrelationEngine:
+    async def process_message(self, db_message, triage_result):
+        # Check for duplicates via hash
+        async with AsyncSessionLocal() as session:
+            # Check if content_hash already exists
+            existing = await session.execute(
+                select(ForwardedMessage).where(ForwardedMessage.content_hash == db_message.content_hash)
+            )
+            if existing.scalar_one_or_none() and existing.scalar_one_or_none().id != db_message.id:
+                # Duplicate, add to cluster of existing
+                # Find cluster of original message
+                cluster_msg = await session.execute(
+                    select(ClusterMessage).where(ClusterMessage.message_id == existing.scalar_one_or_none().id)
+                )
+                if cluster_msg:
+                    cluster_id = cluster_msg.scalar_one().cluster_id
+                    await self._add_to_cluster(session, cluster_id, db_message.id)
+                return
+
+            # Find recent messages with high similarity (text similarity)
+            # For simplicity, we'll just check if same event_type and close in time
+            cutoff = datetime.utcnow() - timedelta(minutes=30)
+            similar = await session.execute(
+                select(EventCluster).where(
+                    EventCluster.start_time >= cutoff,
+                    EventCluster.event_type == triage_result.get("event_type")
+                )
+            )
+            cluster = similar.scalar_one_or_none()
+            if cluster:
+                await self._add_to_cluster(session, cluster.id, db_message.id)
+                # Update cluster scores
+                cluster.importance_score = max(cluster.importance_score, triage_result.get("importance", 0))
+                cluster.urgency_score = max(cluster.urgency_score, triage_result.get("urgency", 0))
+                cluster.confidence_score = (cluster.confidence_score + triage_result.get("confidence", 0)) / 2
+                await session.commit()
+            else:
+                # Create new cluster
+                new_cluster = EventCluster(
+                    title=triage_result.get("summary", "Event"),
+                    start_time=datetime.utcnow(),
+                    importance_score=triage_result.get("importance", 0),
+                    urgency_score=triage_result.get("urgency", 0),
+                    confidence_score=triage_result.get("confidence", 0),
+                    event_type=triage_result.get("event_type", "unknown"),
+                )
+                session.add(new_cluster)
+                await session.flush()
+                await self._add_to_cluster(session, new_cluster.id, db_message.id)
+                await session.commit()
+
+    async def _add_to_cluster(self, session, cluster_id, message_id):
+        cluster_msg = ClusterMessage(cluster_id=cluster_id, message_id=message_id)
+        session.add(cluster_msg)
+
+correlation_engine = CorrelationEngine()
