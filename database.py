@@ -1,12 +1,18 @@
 import sqlite3
 import aiosqlite
 import json
+import os
 import datetime
 from typing import List, Dict, Any, Optional, Tuple
 import config
 
 # ---------- Synchronous initialization ----------
 def init_sync_db():
+    # Ensure data directory exists
+    data_dir = os.path.dirname(config.DB_PATH)
+    if data_dir and not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+    
     conn = sqlite3.connect(config.DB_PATH)
     c = conn.cursor()
 
@@ -29,6 +35,7 @@ def init_sync_db():
             region TEXT
         )
     ''')
+    # ... باقي الجداول كما هي ...
 
     # ---- Forwarded Messages (with dedup) ----
     c.execute('''
