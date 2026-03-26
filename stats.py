@@ -1,9 +1,8 @@
 import datetime
 import database as db
-from typing import Dict, List, Any
+from typing import Dict, Any
 
 async def get_system_status() -> Dict[str, Any]:
-    """جمع جميع بيانات حالة النظام"""
     is_running = await db.get_bot_state("is_running") == "1"
     channels = await db.get_all_channels()
     active_channels = [c for c in channels if c['enabled']]
@@ -22,16 +21,13 @@ async def get_system_status() -> Dict[str, Any]:
     primary = targets.get('primary') or "غير محدد"
     backup = targets.get('backup') or "غير محدد"
     
-    # إحصائيات القنوات (آخر 24 ساعة)
     daily_stats = await db.get_daily_stats(days=1)
     today = datetime.date.today().isoformat()
     channel_stats = {}
     if today in daily_stats:
         channel_stats = daily_stats[today]['channels']
     
-    # أكثر القنوات نشاطاً
     top_channels = sorted(channel_stats.items(), key=lambda x: x[1], reverse=True)[:5]
-    # تحويل المعرفات إلى أسماء إذا أمكن
     top_channels_names = []
     for ch_id, count in top_channels:
         channel = await db.get_channel(int(ch_id))
@@ -53,26 +49,3 @@ async def get_system_status() -> Dict[str, Any]:
         "top_channels": top_channels_names,
         "channel_counts": channel_stats
     }
-
-
-async def get_queue_stats(queue_manager) -> Dict[str, int]:
-    """جمع إحصائيات قوائم الانتظار"""
-    return {
-        "incoming": queue_manager.incoming_queue.qsize(),
-        "alert": queue_manager.alert_queue.qsize(),
-        "correlation": queue_manager.correlation_queue.qsize(),
-        "analysis": queue_manager.analysis_queue.qsize()
-    }
-
-
-async def get_channel_stats(channel_id: int = None) -> Dict:
-    """إحصائيات قناة محددة أو جميع القنوات"""
-    daily_stats = await db.get_daily_stats(days=7)
-    result = {}
-    for date, stats in daily_stats.items():
-        if channel_id:
-            count = stats['channels'].get(str(channel_id), 0)
-            result[date] = count
-        else:
-            result[date] = stats['total_messages']
-    return result
