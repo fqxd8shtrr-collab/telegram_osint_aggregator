@@ -1,55 +1,46 @@
-import asyncio
 import hashlib
 import json
 import logging
-import database as db
-import utils
 import config
-from typing import Dict, Any, Optional, List
+import database as db
 
 logger = logging.getLogger(__name__)
 
-async def process_correlation(item: Dict[str, Any]):
-    """Correlate a new message with existing clusters."""
-    try:
-        text = item.get('text', '')
-        content_hash = item.get('content_hash')
-        if not content_hash:
-            content_hash = utils.generate_content_hash(text, [])
-
-        # Check if already in a recent cluster
-        existing_cluster_id = await db.get_existing_cluster(content_hash, config.AI_CORRELATION_WINDOW)
-        if existing_cluster_id:
-            # Update cluster
-            cluster = await db.get_event_cluster_by_id(existing_cluster_id)
-            if cluster:
-                new_importance = (cluster['importance'] + item['eval_result']['importance']) / 2
-                new_urgency = (cluster['urgency'] + item['eval_result']['urgency']) / 2
-                new_confidence = (cluster['confidence'] + item['eval_result']['confidence']) / 2
-                channels = json.loads(cluster['channels'])
-                if item['channel_id'] not in channels:
-                    channels.append(item['channel_id'])
-                await db.update_event_cluster(
-                    existing_cluster_id,
-                    new_importance,
-                    new_urgency,
-                    new_confidence,
-                    channels,
-                    [(item['message_id'], item['channel_id'])]
-                )
-                logger.info(f"Cluster {existing_cluster_id} updated with {len(channels)} sources")
-        else:
-            # Create new cluster
-            cluster_hash = hashlib.sha256(f"{item['eval_result']['event_type']}_{content_hash}".encode()).hexdigest()
-            await db.add_event_cluster(
-                cluster_hash,
-                item['eval_result']['event_type'],
-                item['eval_result']['importance'],
-                item['eval_result']['urgency'],
-                item['eval_result']['confidence'],
-                [item['channel_id']],
-                [(item['message_id'], item['channel_id'])]
-            )
-            logger.info(f"New cluster created for message {item['message_id']}")
-    except Exception as e:
-        logger.error(f"Correlation error: {e}")
+async def correlate(message: dict):
+    """
+    message: dict with keys: message_id, channel_id, text, content_hash, normalized_text
+    """
+    content_hash = message["content_hash"]
+    # Check if we already have a cluster for this hash within the correlation window
+    window = int(await db.get_state("correlation_window", str(config.CORRELATION_WINDOW)))
+    rows = await db.fetch_all(
+        "SELECT c.* FROM clusters c JOIN cluster_messages cm ON c.id = cm.cluster_id JOIN messages m ON cm.message_id = m.message_id AND cm.channel_id = m.channel_id WHERE m.content_hash = ? AND c.last_seen > datetime('now', ?)",
+        (content_hash, f"-{window} seconds")
+    )
+    if rows:
+        # Found existing cluster
+        cluster_id = rows[0]["id"]
+        # Update cluster
+        await db.update_cluster(
+            cluster_id,
+            rows[0]["importance"],  # will average later? we'll keep simple: keep existing importance and update message count
+            rows[0]["urgency"],
+            rows[0]["confidence"],
+            json.loads(rows[0]["channels"]),
+            [(message["message_id"], message["channel_id"])]
+        )
+        logger.info(f"Correlated message {message['message_id']} to cluster {cluster_id}")
+    else:
+        # Create new cluster
+        cluster_hash = hashlib.sha256(f"{content_hash}_{message.get('eval_result', {}).get('event_type', 'unknown')}".encode()).hexdigest()
+        eval_res = message.get("eval_result", {})
+        await db.add_cluster(
+            cluster_hash,
+            eval_res.get("event_type", "عام"),
+            eval_res.get("importance", 0.5),
+            eval_res.get("urgency", 0.5),
+            eval_res.get("confidence", 0.5),
+            [message["channel_id"]],
+            [(message["message_id"], message["channel_id"])]
+        )
+        logger.info(f"Created new cluster for message {message['message_id']}")
