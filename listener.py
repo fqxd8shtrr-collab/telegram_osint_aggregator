@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from telethon import TelegramClient, events
-from telethon.tl.types import Message, MessageMediaDocument, MessageMediaPhoto, MessageMediaVideo
+from telethon.tl.types import Message, MessageMediaPhoto, MessageMediaDocument
 import config
 import database as db
 import utils
@@ -37,36 +37,27 @@ class Listener:
     async def handle_message(self, message: Message):
         if not self.is_running:
             return
-        # Check if from active channel
         if not hasattr(message.peer_id, 'channel_id'):
             return
         channel_id = message.peer_id.channel_id
         if channel_id not in self.active_channels:
             return
 
-        # Basic dedup by message_id (quick)
         if await db.is_message_forwarded(channel_id, message.id):
             logger.debug(f"Message {message.id} already forwarded.")
             return
 
-        # Extract content
         text = message.text or message.caption or ""
         content_type = self._get_content_type(message)
 
-        # Generate content hash
         media_ids = []
         if message.photo:
             media_ids.append(message.photo.id)
-        elif message.video:
-            media_ids.append(message.video.id)
         elif message.document:
             media_ids.append(message.document.id)
         content_hash = utils.generate_content_hash(text, media_ids)
-
-        # Normalized text for dedup
         normalized_text = utils.normalize_text(text)
 
-        # Prepare payload for queue
         payload = {
             'message_id': message.id,
             'channel_id': channel_id,
@@ -78,12 +69,7 @@ class Listener:
             'channel_info': self.active_channels[channel_id]
         }
 
-        # Put into incoming queue for triage
         await self.queue_manager.incoming_queue.put(payload)
-
-        # Mark as forwarded (prevent future processing by listener, but we will still use hash for dedup)
-        # Actually we mark after successful processing? Better mark after triage/alert to avoid duplicates if something fails.
-        # But to prevent double processing by listener, we mark now.
         await db.mark_message_forwarded(channel_id, message.id, content_hash, None, normalized_text)
 
     def _get_content_type(self, message: Message) -> str:
@@ -91,21 +77,20 @@ class Listener:
             return "text"
         if message.photo:
             return "photo"
-        if message.video:
-            return "video"
         if message.document:
-            if hasattr(message.document, 'mime_type') and message.document.mime_type.startswith('audio'):
+            mime = getattr(message.document, 'mime_type', '')
+            if mime.startswith('audio'):
                 return "audio"
+            if mime.startswith('video'):
+                return "video"
             return "document"
         return "text"
 
     async def send_message(self, destination: str, formatted_text: str, original_payload: dict):
-        """Send a message to a destination using the user client."""
         try:
             dest_entity = await self.client.get_entity(destination)
             original_message = original_payload.get('original_message')
             if original_message:
-                # If we have original message, we can forward or copy
                 mode = await db.get_bot_state("forward_mode", "copy")
                 if mode == "forward":
                     try:
@@ -113,12 +98,9 @@ class Listener:
                         return
                     except:
                         pass
-                # Copy
                 media = None
                 if original_message.photo:
                     media = original_message.photo
-                elif original_message.video:
-                    media = original_message.video
                 elif original_message.document:
                     media = original_message.document
                 if media:
