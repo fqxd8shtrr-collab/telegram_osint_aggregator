@@ -1,334 +1,152 @@
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import config
-import database as db
-import utils
-from listener import Listener
-from queue_manager import QueueManager
+from database import AsyncSessionLocal, SourceChannel, OutputTarget, User, RoutingRule, BotState
+from sqlalchemy import select
+from listener import listener
+import asyncio
+from health_monitor import health_monitor
+from stats import get_stats
 
 logger = logging.getLogger(__name__)
 
-class ControlBot:
-    def __init__(self, listener: Listener, queue_manager: QueueManager):
-        self.listener = listener
-        self.qm = queue_manager
-        self.app = None
-
-    async def start(self):
-        self.app = Application.builder().token(config.BOT_TOKEN).build()
-        self.app.add_handler(CommandHandler("start", self.start_command))
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
-        self.app.add_handler(CallbackQueryHandler(self.handle_callback))
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling()
-        logger.info("Bot started.")
-
-    async def stop(self):
-        await self.app.updater.stop()
-        await self.app.stop()
-
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in config.ALLOWED_USER_IDS:
-            await update.message.reply_text("⛔ غير مصرح.")
-            return
-        keyboard = [
-            [KeyboardButton("📡 إدارة المصادر"), KeyboardButton("🎯 التحكم بالإرسال")],
-            [KeyboardButton("🧠 الذكاء الاصطناعي"), KeyboardButton("👥 إدارة الفريق")],
-            [KeyboardButton("📊 الحالة والإحصائيات"), KeyboardButton("⚙️ الإعدادات")],
-            [KeyboardButton("🗑 الإدارة")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text(
-            "🌐 **Telegram OSINT Aggregator - Team Edition**\nاختر أحد الأزرار:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-
-    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in config.ALLOWED_USER_IDS:
-            await update.message.reply_text("⛔ غير مصرح.")
-            return
-        text = update.message.text
-        if text == "📡 إدارة المصادر":
-            await self.show_sources_menu(update, context)
-        elif text == "🎯 التحكم بالإرسال":
-            await self.show_forward_menu(update, context)
-        elif text == "🧠 الذكاء الاصطناعي":
-            await self.show_ai_menu(update, context)
-        elif text == "👥 إدارة الفريق":
-            await self.show_team_menu(update, context)
-        elif text == "📊 الحالة والإحصائيات":
-            await self.show_status(update, context)
-        elif text == "⚙️ الإعدادات":
-            await self.show_settings_menu(update, context)
-        elif text == "🗑 الإدارة":
-            await self.show_admin_menu(update, context)
-        else:
-            await update.message.reply_text("استخدم الأزرار من القائمة.")
-
-    async def show_sources_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
-            [InlineKeyboardButton("➕ إضافة قناة يدويًا", callback_data="add_channel_manual")],
-            [InlineKeyboardButton("📋 عرض القنوات المشترك بها", callback_data="list_subscribed")],
-            [InlineKeyboardButton("📋 عرض القنوات المُضافة", callback_data="list_channels")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("📡 إدارة المصادر:", reply_markup=reply_markup)
-
-    async def show_forward_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
-            [InlineKeyboardButton("🎯 تعيين الوجهة الرئيسية", callback_data="set_primary")],
-            [InlineKeyboardButton("🚨 تعيين وجهة التنبيهات", callback_data="set_alert")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("🎯 التحكم بالإرسال:", reply_markup=reply_markup)
-
-    async def show_ai_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
-            [InlineKeyboardButton("⚡ وضع السرعة القصوى", callback_data="toggle_fast_mode")],
-            [InlineKeyboardButton("📊 عرض آخر التقييمات", callback_data="show_ai_stats")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("🧠 الذكاء الاصطناعي:", reply_markup=reply_markup)
-
-    async def show_team_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
-            [InlineKeyboardButton("👥 عرض الأعضاء", callback_data="list_team")],
-            [InlineKeyboardButton("➕ إضافة عضو", callback_data="add_member")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("👥 إدارة الفريق:", reply_markup=reply_markup)
-
-    async def show_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        is_running = await db.get_state("is_running") == "1"
-        channels = await db.get_all_channels()
-        active = sum(1 for c in channels if c["enabled"])
-        total_forwarded = await db.get_state("total_forwarded", "0")
-        total_alerts = await db.get_state("total_alerts", "0")
-        last_activity = await db.get_state("last_activity", "لا يوجد")
-        uptime = await db.get_state("uptime", "0")
-        text = (
-            f"📊 **حالة النظام**\n"
-            f"🟢 الشبكة: {'تعمل' if is_running else 'متوقفة'}\n"
-            f"📡 القنوات: {len(channels)} (نشطة: {active})\n"
-            f"📨 الرسائل المرسلة: {total_forwarded}\n"
-            f"🚨 التنبيهات المرسلة: {total_alerts}\n"
-            f"🕒 آخر نشاط: {last_activity}\n"
-            f"⏱ التشغيل: {uptime} ثانية\n"
-            f"📥 قائمة الانتظار: {self.qm.incoming_queue.qsize()}"
-        )
-        await update.message.reply_text(text, parse_mode='Markdown')
-
-    async def show_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
-            [InlineKeyboardButton("🔘 تشغيل/إيقاف الشبكة", callback_data="toggle_network")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("⚙️ الإعدادات:", reply_markup=reply_markup)
-
-    async def show_admin_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        keyboard = [
-            [InlineKeyboardButton("🧪 اختبار الإرسال", callback_data="test_send")],
-            [InlineKeyboardButton("🗑 مسح السجل", callback_data="clear_logs")],
-            [InlineKeyboardButton("♻️ إعادة تهيئة النظام", callback_data="reset_system")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("🗑 الإدارة:", reply_markup=reply_markup)
-
-    async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        data = query.data
+# Helper to check if user is allowed
+def authorized(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        if user_id not in config.ALLOWED_USER_IDS:
-            await query.edit_message_text("⛔ غير مصرح.")
+        if user_id not in config.ALLOWED_USERS:
+            await update.message.reply_text("غير مصرح لك باستخدام هذا البوت.")
             return
+        return await func(update, context)
+    return wrapper
 
-        if data == "main_menu":
-            await self.start_command(update, context)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # Add user to database if not exists
+    async with AsyncSessionLocal() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            user = User(telegram_id=user_id, username=update.effective_user.username, role="admin")
+            session.add(user)
+            await session.commit()
+    await show_main_menu(update, context)
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📡 إدارة المصادر", callback_data="manage_sources")],
+        [InlineKeyboardButton("🎯 التحكم بالإرسال", callback_data="manage_outputs")],
+        [InlineKeyboardButton("🤖 الذكاء الاصطناعي", callback_data="ai_settings")],
+        [InlineKeyboardButton("🌍 إدارة الواجهات", callback_data="manage_outputs")],
+        [InlineKeyboardButton("🧠 الفلاتر", callback_data="filters")],
+        [InlineKeyboardButton("👥 إدارة الفريق", callback_data="team_management")],
+        [InlineKeyboardButton("📊 الحالة والإحصائيات", callback_data="stats")],
+        [InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")],
+        [InlineKeyboardButton("🗑 الإدارة", callback_data="admin")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("قائمة التحكم الرئيسية:", reply_markup=reply_markup)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "manage_sources":
+        await list_sources(query)
+    elif data == "manage_outputs":
+        await list_outputs(query)
+    elif data == "stats":
+        await show_stats(query)
+    # ... other handlers
+
+async def list_sources(query):
+    # Fetch all source channels from DB
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(SourceChannel))
+        sources = result.scalars().all()
+        if not sources:
+            await query.edit_message_text("لا توجد مصادر. استخدم /add_source لإضافة مصدر.")
             return
+        text = "📡 المصادر:\n"
+        buttons = []
+        for src in sources:
+            text += f"\n• {src.title or src.username} - {'نشط' if src.enabled else 'معطل'}"
+            buttons.append([InlineKeyboardButton(f"{src.title or src.username}", callback_data=f"source_{src.id}")])
+        buttons.append([InlineKeyboardButton("رجوع", callback_data="main_menu")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
-        # Sources
-        elif data == "add_channel_manual":
-            context.user_data["action"] = "add_channel"
-            await query.edit_message_text("أرسل معرف القناة (@username أو رابط أو id):")
-        elif data == "list_subscribed":
-            # Fetch user's channels from Telethon
-            try:
-                channels = await self.listener.get_my_channels()
-                if not channels:
-                    await query.edit_message_text("لا توجد قنوات مشترك فيها.")
-                    return
-                # Build a list with checkboxes
-                keyboard = []
-                for ch in channels:
-                    # Check if already added
-                    existing = await db.get_channel(ch["id"])
-                    checked = "✅ " if existing else "⬜ "
-                    keyboard.append([InlineKeyboardButton(f"{checked}{ch['title']} ({ch.get('username', '')})", callback_data=f"toggle_channel_{ch['id']}")])
-                keyboard.append([InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")])
-                await query.edit_message_text("اختر القنوات لإضافتها:", reply_markup=InlineKeyboardMarkup(keyboard))
-            except Exception as e:
-                await query.edit_message_text(f"خطأ في جلب القنوات: {e}")
-        elif data.startswith("toggle_channel_"):
-            ch_id = int(data.split("_")[2])
-            existing = await db.get_channel(ch_id)
-            if existing:
-                await db.remove_source_channel(ch_id)
-                await query.edit_message_text(f"❌ تم إزالة القناة {ch_id} من القائمة.")
-            else:
-                # Fetch channel details from Telethon
-                try:
-                    entity = await self.listener.client.get_entity(ch_id)
-                    await db.add_channel(ch_id, entity.username, entity.title, entity.title)
-                    await query.edit_message_text(f"✅ تم إضافة القناة {entity.title}")
-                except Exception as e:
-                    await query.edit_message_text(f"فشل إضافة القناة: {e}")
-            # Reload listener channels
-            await self.listener.reload_channels()
-        elif data == "list_channels":
-            channels = await db.get_all_channels()
-            if not channels:
-                text = "لا توجد قنوات مضافة."
-            else:
-                text = "📋 القنوات:\n"
-                for ch in channels:
-                    status = "🟢" if ch["enabled"] else "🔴"
-                    text += f"{status} {ch.get('label', ch['title'])} ({ch['channel_id']})\n"
-            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]]))
+async def show_stats(query):
+    stats = await get_stats()
+    text = f"📊 الإحصائيات:\n"
+    text += f"• رسائل في الدقيقة: {stats.get('messages_per_minute', 0)}\n"
+    text += f"• التنبيهات: {stats.get('alerts_sent', 0)}\n"
+    text += f"• حجم الطابور: {stats.get('queue_size', 0)}\n"
+    text += f"• وقت التشغيل: {stats.get('uptime', '')}\n"
+    text += f"• آخر خطأ: {stats.get('last_error', 'لا يوجد')}\n"
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع", callback_data="main_menu")]]))
 
-        # Forward
-        elif data == "set_primary":
-            context.user_data["action"] = "set_primary"
-            await query.edit_message_text("أرسل معرف الوجهة الرئيسية:")
-        elif data == "set_alert":
-            context.user_data["action"] = "set_alert"
-            await query.edit_message_text("أرسل معرف وجهة التنبيهات:")
-
-        # AI
-        elif data == "toggle_fast_mode":
-            current = await db.get_state("ai_fast_mode", "1")
-            new = "0" if current == "1" else "1"
-            await db.set_state("ai_fast_mode", new)
-            await query.edit_message_text(f"وضع السرعة {'مفعل' if new == '1' else 'معطل'}")
-        elif data == "show_ai_stats":
-            # Show last 5 evaluations
-            rows = await db.fetch_all("SELECT * FROM evaluations ORDER BY evaluated_at DESC LIMIT 5")
-            if rows:
-                text = "آخر 5 تقييمات:\n"
-                for r in rows:
-                    text += f"رسالة {r['message_id']}: أهمية {r['importance']:.2f}, عجلة {r['urgency']:.2f}, ثقة {r['confidence']:.2f}, نوع {r['event_type']}\n"
-            else:
-                text = "لا توجد تقييمات."
-            await query.edit_message_text(text)
-
-        # Team
-        elif data == "list_team":
-            users = await db.get_users()
-            if not users:
-                text = "لا يوجد أعضاء."
-            else:
-                text = "👥 أعضاء الفريق:\n"
-                for u in users:
-                    text += f"{u['user_id']} - {u['username']} - {u['role']}\n"
-            await query.edit_message_text(text)
-        elif data == "add_member":
-            context.user_data["action"] = "add_member"
-            await query.edit_message_text("أرسل معرف المستخدم واسم المستخدم والدور (admin/analyst/editor/monitor) في سطر واحد:\nمثال: 123456789 username analyst")
-
-        # Settings
-        elif data == "toggle_network":
-            current = await db.get_state("is_running") == "1"
-            new = "0" if current else "1"
-            await db.set_state("is_running", new)
-            self.listener.is_running = not current
-            await query.edit_message_text(f"الشبكة {'متوقفة' if current else 'تعمل'}")
-
-        # Admin
-        elif data == "test_send":
-            primary = await db.get_forward_target("primary")
-            if not primary:
-                await query.edit_message_text("لا توجد وجهة رئيسية.")
+# Command to add source channel (manual)
+@authorized
+async def add_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Expects /add_source @channelusername
+    if len(context.args) == 0:
+        await update.message.reply_text("الاستخدام: /add_source @channelusername")
+        return
+    username = context.args[0]
+    # Fetch entity via listener client
+    try:
+        entity = await listener.client.get_entity(username)
+        async with AsyncSessionLocal() as session:
+            # Check if exists
+            existing = await session.execute(select(SourceChannel).where(SourceChannel.telegram_id == entity.id))
+            if existing.scalar_one_or_none():
+                await update.message.reply_text("المصدر موجود بالفعل.")
                 return
-            try:
-                await self.listener.send_message(primary, "🧪 رسالة اختبار من نظام الرصد.")
-                await query.edit_message_text("✅ تم إرسال رسالة اختبار.")
-            except Exception as e:
-                await query.edit_message_text(f"❌ فشل الإرسال: {e}")
-        elif data == "clear_logs":
-            await db.execute("DELETE FROM health_metrics")
-            await query.edit_message_text("✅ تم مسح السجل.")
-        elif data == "reset_system":
-            # Dangerous: delete all data
-            await db.execute("DELETE FROM channels")
-            await db.execute("DELETE FROM messages")
-            await db.execute("DELETE FROM evaluations")
-            await db.execute("DELETE FROM clusters")
-            await db.execute("DELETE FROM cluster_messages")
-            await db.execute("DELETE FROM assignments")
-            await db.execute("DELETE FROM comments")
-            await db.execute("DELETE FROM users")
-            await db.execute("DELETE FROM health_metrics")
-            await db.set_state("total_forwarded", "0")
-            await db.set_state("total_alerts", "0")
-            await db.set_state("last_error", "")
-            await db.set_state("last_activity", "")
-            await self.listener.reload_channels()
-            await query.edit_message_text("♻️ تم إعادة تهيئة النظام.")
-        else:
-            await query.edit_message_text("أمر غير معروف.")
+            src = SourceChannel(
+                telegram_id=entity.id,
+                username=entity.username,
+                title=entity.title,
+                enabled=True,
+                label="",
+                category="",
+                trust_score=1.0,
+                priority_score=1.0,
+                target_outputs=[],
+                video_only=False
+            )
+            session.add(src)
+            await session.commit()
+            await update.message.reply_text(f"تمت إضافة المصدر {entity.title} بنجاح.")
+    except Exception as e:
+        await update.message.reply_text(f"خطأ: {e}")
 
-    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # This is called after start_command's handle_text; we already have actions in context.user_data
-        text = update.message.text
-        action = context.user_data.get("action")
-        if action:
-            await self.process_input(update, context, action, text)
-            context.user_data.pop("action", None)
-            return
-        # Otherwise, this text is already handled by the main text handler above
+# Command to list all subscribed channels from the personal account and add them in bulk
+@authorized
+async def sync_subscribed_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Get all dialogs from listener client
+    dialogs = await listener.client.get_dialogs()
+    channels = [d for d in dialogs if d.is_channel]
+    text = "القنوات المشترك بها:\n"
+    buttons = []
+    for ch in channels:
+        text += f"\n• {ch.title}"
+        buttons.append([InlineKeyboardButton(ch.title, callback_data=f"select_channel_{ch.entity.id}")])
+    buttons.append([InlineKeyboardButton("تحديد الكل", callback_data="select_all")])
+    buttons.append([InlineKeyboardButton("إلغاء التحديد", callback_data="clear_all")])
+    buttons.append([InlineKeyboardButton("إضافة المحدد كمصادر", callback_data="add_selected_sources")])
+    buttons.append([InlineKeyboardButton("رجوع", callback_data="main_menu")])
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
-    async def process_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, text: str):
-        if action == "add_channel":
-            try:
-                entity = await self.listener.client.get_entity(text)
-                ch_id = entity.id
-                title = entity.title
-                username = entity.username
-                success = await db.add_channel(ch_id, username, title, title)
-                if success:
-                    await update.message.reply_text(f"✅ تم إضافة القناة: {title}")
-                    await self.listener.reload_channels()
-                else:
-                    await update.message.reply_text("⚠️ القناة موجودة مسبقاً.")
-            except Exception as e:
-                await update.message.reply_text(f"فشل الإضافة: {e}")
-        elif action == "set_primary":
-            await db.set_forward_target("primary", text)
-            await update.message.reply_text(f"🎯 تم تعيين الوجهة الرئيسية: {text}")
-        elif action == "set_alert":
-            await db.set_forward_target("critical_alert", text)
-            await update.message.reply_text(f"🚨 تم تعيين وجهة التنبيهات: {text}")
-        elif action == "add_member":
-            parts = text.split()
-            if len(parts) < 3:
-                await update.message.reply_text("تنسيق غير صحيح. استخدم: user_id username role")
-                return
-            user_id = int(parts[0])
-            username = parts[1]
-            role = parts[2].lower()
-            if role not in ["admin", "analyst", "editor", "monitor"]:
-                await update.message.reply_text("الدور غير صالح.")
-                return
-            await db.add_user(user_id, username, role)
-            await update.message.reply_text(f"✅ تم إضافة العضو {username} بدور {role}.")
-        else:
-            await update.message.reply_text("إجراء غير معروف.")
+# Similar handlers for outputs, routing, etc.
+
+def main():
+    app = Application.builder().token(config.BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add_source", add_source))
+    app.add_handler(CommandHandler("sync", sync_subscribed_channels))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
