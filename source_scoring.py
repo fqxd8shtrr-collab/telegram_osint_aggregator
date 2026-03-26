@@ -1,26 +1,20 @@
-import database as db
-from typing import Dict
+import logging
+from database import AsyncSessionLocal, SourceChannel
+import config
 
-async def get_source_score(channel_id: int) -> Dict[str, float]:
-    """Return trust, speed, priority scores for a channel."""
-    channel = await db.get_channel(channel_id)
-    if not channel:
-        return {'trust': 0.5, 'speed': 0.5, 'priority': 0.5}
-    return {
-        'trust': channel.get('trust_score', 0.5),
-        'speed': channel.get('speed_score', 0.5),
-        'priority': channel.get('priority_score', 0.5)
-    }
+logger = logging.getLogger(__name__)
 
-async def adjust_importance_with_source(importance: float, channel_id: int) -> float:
-    """Adjust importance based on source scores."""
-    scores = await get_source_score(channel_id)
-    # Boost by trust and priority
-    adjusted = importance * (0.5 + 0.5 * scores['trust']) * (0.5 + 0.5 * scores['priority'])
-    return min(adjusted, 1.0)
+class SourceScoring:
+    async def update_source_score(self, source_channel_id, triage_result):
+        async with AsyncSessionLocal() as session:
+            source = await session.get(SourceChannel, source_channel_id)
+            if source:
+                # Increase trust if messages are often important
+                importance = triage_result.get("importance", 0)
+                if importance > 0.8:
+                    source.trust_score = min(1.0, source.trust_score + 0.01)
+                elif importance < 0.3:
+                    source.trust_score = max(0, source.trust_score - 0.005)
+                await session.commit()
 
-async def adjust_urgency_with_source(urgency: float, channel_id: int) -> float:
-    """Adjust urgency based on source speed."""
-    scores = await get_source_score(channel_id)
-    adjusted = urgency * (0.5 + 0.5 * scores['speed'])
-    return min(adjusted, 1.0)
+source_scoring = SourceScoring()
