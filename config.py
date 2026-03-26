@@ -1,38 +1,35 @@
 import os
+from dotenv import load_dotenv
 
-# -------------------- Telethon --------------------
-API_ID = int(os.environ.get("API_ID", 123456))
-API_HASH = os.environ.get("API_HASH", "your_api_hash")
-PHONE_NUMBER = os.environ.get("PHONE_NUMBER", "+1234567890")
+load_dotenv()
 
-# -------------------- Bot --------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
+# Telegram credentials
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")  # for Telethon
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# -------------------- Security --------------------
-ALLOWED_USER_IDS = [int(x) for x in os.environ.get("ALLOWED_USER_IDS", "123456789").split(",")]
+# Database
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///data/osint.db")
 
-# -------------------- Database --------------------
-DB_PATH = os.environ.get("DB_PATH", "data/osint.db")  # SQLite file path
-# Use PostgreSQL if needed: DATABASE_URL = os.environ.get("DATABASE_URL")
+# Allowed admin user IDs (comma separated)
+ALLOWED_USERS = [int(x.strip()) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()]
 
-# -------------------- Performance --------------------
-MAX_QUEUE_SIZE = 2000
-TRIAGE_WORKERS = 2
-ALERT_WORKERS = 1
-CORRELATION_WORKERS = 1
-DEEP_ANALYSIS_WORKERS = 0  # 0 = disabled
+# AI models settings
+FAST_AI_MODEL = os.getenv("FAST_AI_MODEL", "distilbert-base-uncased")  # fast triage
+DEEP_AI_MODEL = os.getenv("DEEP_AI_MODEL", "gpt-3.5-turbo")           # deep analysis
 
-# -------------------- AI Settings --------------------
-# Fast mode: keyword/pattern-based triage (milliseconds)
-AI_FAST_MODE = True
-# Importance/urgency thresholds for alerting
-IMPORTANCE_THRESHOLD = 0.7
-URGENCY_THRESHOLD = 0.7
-CONFIDENCE_THRESHOLD = 0.6
+# Translation API
+TRANSLATION_API = os.getenv("TRANSLATION_API", "google")  # 'google' or 'deepl'
+GOOGLE_TRANSLATE_API_KEY = os.getenv("GOOGLE_TRANSLATE_API_KEY", "")
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "")
 
-# -------------------- Correlation --------------------
-CORRELATION_WINDOW = 120  # seconds
-SIMILARITY_THRESHOLD = 0.8
+# Worker settings
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
+QUEUE_SIZE = int(os.getenv("QUEUE_SIZE", "1000"))
 
-# -------------------- Categories --------------------
-CATEGORIES = ["عسكري", "سياسي", "أمني", "اقتصادي", "إعلامي", "دبلوماسي", "محلي", "دولي"]
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+# Health check interval (seconds)
+HEALTH_INTERVAL = int(os.getenv("HEALTH_INTERVAL", "60"))
