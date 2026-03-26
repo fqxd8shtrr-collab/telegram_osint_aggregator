@@ -1,141 +1,78 @@
 import asyncio
 import logging
 from telethon import TelegramClient, events
-from telethon.tl.types import Message
 import config
-import database as db
-import utils
-from queue_manager import QueueManager
+from database import AsyncSessionLocal, SourceChannel
+from queue_manager import queue_manager
+from utils import compute_content_hash
+import traceback
 
+logging.basicConfig(level=config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-class Listener:
-    def __init__(self, queue_manager: QueueManager):
-        self.client = TelegramClient('user_session', config.API_ID, config.API_HASH)
-        self.queue_manager = queue_manager
-        self.is_running = False
-        self.active_channels = set()  # set of channel IDs that are enabled in DB
+class TelegramListener:
+    def __init__(self):
+        self.client = TelegramClient(
+            'osint_session',
+            config.API_ID,
+            config.API_HASH,
+            connection_retries=5,
+            auto_reconnect=True
+        )
+        self.running = False
 
     async def start(self):
-        await self.client.start(phone=config.PHONE_NUMBER)
-        logger.info("User client started.")
-        await self._reload_active_channels()
-        self.is_running = True
+        await self.client.start(config.SESSION_STRING)
+        logger.info("Telegram client started")
+        # Fetch all subscribed channels from database and add to event handler
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                "SELECT telegram_id FROM source_channels WHERE enabled = 1"
+            )
+            channels = result.scalars().all()
+            for channel_id in channels:
+                # Ensure we are a member
+                try:
+                    await self.client.get_entity(channel_id)
+                except:
+                    logger.warning(f"Cannot access channel {channel_id}, skipping")
+                    continue
 
-        @self.client.on(events.NewMessage(incoming=True))
+        @self.client.on(events.NewMessage(chats=channels))
         async def handler(event):
-            await self.handle_message(event.message)
+            await self.on_message(event)
 
-    async def _reload_active_channels(self):
-        channels = await db.get_all_channels()
-        self.active_channels = {c["channel_id"] for c in channels if c["enabled"]}
-        logger.info(f"Loaded {len(self.active_channels)} active channels.")
+        self.running = True
+        await self.client.run_until_disconnected()
 
-    async def reload_channels(self):
-        await self._reload_active_channels()
-
-    async def handle_message(self, message: Message):
-        if not self.is_running:
-            return
-        # Check if from a dialog (group/channel)
-        if not hasattr(message.peer_id, 'channel_id'):
-            return
-        channel_id = message.peer_id.channel_id
-        if channel_id not in self.active_channels:
-            return
-
-        # Dedup by message_id (quick)
-        if await db.is_message_processed(channel_id, message.id):
-            logger.debug(f"Message {message.id} already processed.")
-            return
-
-        text = message.text or message.caption or ""
-        content_type = self._get_content_type(message)
-
-        media_ids = []
-        if message.photo:
-            media_ids.append(message.photo.id)
-        elif message.document:
-            media_ids.append(message.document.id)
-        content_hash = utils.generate_content_hash(text, media_ids)
-        normalized_text = utils.normalize_text(text)
-
-        # Save message immediately to prevent duplicates
-        await db.save_message(channel_id, message.id, content_hash, normalized_text)
-
-        # Create payload for queue
-        payload = {
-            "message_id": message.id,
-            "channel_id": channel_id,
-            "text": text,
-            "content_type": content_type,
-            "content_hash": content_hash,
-            "normalized_text": normalized_text,
-            "original_message": message,
-            "channel_info": await db.get_channel(channel_id)
-        }
-
-        await self.queue_manager.incoming_queue.put(payload)
-        logger.debug(f"Message {message.id} from channel {channel_id} queued")
-
-    def _get_content_type(self, message: Message) -> str:
-        if message.text:
-            return "text"
-        if message.photo:
-            return "photo"
-        if message.document:
-            mime = getattr(message.document, 'mime_type', '')
-            if mime.startswith('audio'):
-                return "audio"
-            if mime.startswith('video'):
-                return "video"
-            return "document"
-        return "text"
-
-    async def send_message(self, destination: str, text: str, original_payload: dict = None):
-        """Send a text message (or forward) using the user client."""
+    async def on_message(self, event):
         try:
-            dest_entity = await self.client.get_entity(destination)
-            if original_payload and original_payload.get("original_message"):
-                # Try forward
-                mode = await db.get_state("forward_mode", "copy")
-                if mode == "forward":
-                    try:
-                        await self.client.forward_messages(dest_entity, messages=original_payload["original_message"])
-                        return
-                    except:
-                        pass
-                # Fallback to copy
-                media = None
-                msg = original_payload["original_message"]
-                if msg.photo:
-                    media = msg.photo
-                elif msg.document:
-                    media = msg.document
-                if media:
-                    await self.client.send_file(dest_entity, media, caption=text)
-                else:
-                    await self.client.send_message(dest_entity, text)
-            else:
-                await self.client.send_message(dest_entity, text)
-        except Exception as e:
-            logger.error(f"Send error: {e}")
+            # Extract message details
+            message = event.message
+            if not message.text and not message.media:
+                return
 
-    async def get_my_channels(self):
-        """Fetch all dialogs and return channels where user is member."""
-        dialogs = await self.client.get_dialogs()
-        channels = []
-        for d in dialogs:
-            if d.is_channel:
-                channels.append({
-                    "id": d.id,
-                    "title": d.title,
-                    "username": d.username,
-                    "is_participant": True  # Since we are in the dialog, we are participant
-                })
-        return channels
+            # Compute hashes for deduplication
+            content_hash = compute_content_hash(message)
+            normalized_text = message.text.lower().strip() if message.text else ""
+            normalized_text_hash = compute_content_hash(normalized_text)
+
+            # Push to queue for processing
+            await queue_manager.push({
+                "type": "message",
+                "message": message,
+                "channel_id": event.chat_id,
+                "content_hash": content_hash,
+                "normalized_text_hash": normalized_text_hash,
+                "raw_text": message.text or "",
+                "media": message.media,
+            })
+        except Exception as e:
+            logger.error(f"Error handling message: {e}\n{traceback.format_exc()}")
 
     async def stop(self):
-        self.is_running = False
+        self.running = False
         await self.client.disconnect()
-        logger.info("Listener stopped.")
+        logger.info("Listener stopped")
+
+listener = TelegramListener()
