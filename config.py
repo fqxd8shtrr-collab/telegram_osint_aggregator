@@ -1,48 +1,38 @@
 import os
 
-# ---------- Telethon User Session ----------
+# -------------------- Telethon --------------------
 API_ID = int(os.environ.get("API_ID", 123456))
 API_HASH = os.environ.get("API_HASH", "your_api_hash")
 PHONE_NUMBER = os.environ.get("PHONE_NUMBER", "+1234567890")
 
-# ---------- Bot ----------
+# -------------------- Bot --------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
 
-# ---------- Security ----------
+# -------------------- Security --------------------
 ALLOWED_USER_IDS = [int(x) for x in os.environ.get("ALLOWED_USER_IDS", "123456789").split(",")]
 
-# ---------- Database ----------
-DB_PATH = os.environ.get("DB_PATH", "data/osint.db")
+# -------------------- Database --------------------
+DB_PATH = os.environ.get("DB_PATH", "data/osint.db")  # SQLite file path
+# Use PostgreSQL if needed: DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# ---------- Default Settings ----------
-DEFAULT_FORWARD_MODE = "copy"
-DEFAULT_CONTENT_TYPES = ["text", "photo", "video", "document", "audio"]
-
-# ---------- Performance ----------
-MAX_CONCURRENT_TASKS = 10
-QUEUE_MAX_SIZE = 1000
-
+# -------------------- Performance --------------------
+MAX_QUEUE_SIZE = 2000
 TRIAGE_WORKERS = 2
 ALERT_WORKERS = 1
 CORRELATION_WORKERS = 1
-DEEP_ANALYSIS_WORKERS = 0
+DEEP_ANALYSIS_WORKERS = 0  # 0 = disabled
 
-# ---------- Categories ----------
-CATEGORIES = [
-    "عسكري", "أمني", "سياسي", "اقتصادي", "إعلامي", "دبلوماسي", "محلي", "دولي"
-]
-
-# ---------- AI Settings ----------
-AI_ENABLED = True
+# -------------------- AI Settings --------------------
+# Fast mode: keyword/pattern-based triage (milliseconds)
 AI_FAST_MODE = True
-AI_IMPORTANCE_THRESHOLD = 0.7
-AI_URGENCY_THRESHOLD = 0.7
-AI_CONFIDENCE_THRESHOLD = 0.6
-AI_CORRELATION_WINDOW = 120
-AI_CORRELATION_SIMILARITY = 0.8
-DEEP_ANALYSIS_ENABLED = False
+# Importance/urgency thresholds for alerting
+IMPORTANCE_THRESHOLD = 0.7
+URGENCY_THRESHOLD = 0.7
+CONFIDENCE_THRESHOLD = 0.6
 
-# ---------- Source Scoring ----------
-DEFAULT_TRUST_SCORE = 0.5
-DEFAULT_SPEED_SCORE = 0.5
-DEFAULT_PRIORITY_SCORE = 0.5
+# -------------------- Correlation --------------------
+CORRELATION_WINDOW = 120  # seconds
+SIMILARITY_THRESHOLD = 0.8
+
+# -------------------- Categories --------------------
+CATEGORIES = ["عسكري", "سياسي", "أمني", "اقتصادي", "إعلامي", "دبلوماسي", "محلي", "دولي"]
